@@ -4,7 +4,7 @@ name = "weirdnet-themes"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
-description = "Weirdnet themes: a TOML theme format with dark and light variants, 21 semantic colour roles, built-in palettes, contrast checks and optional ratatui colours."
+description = "Weirdnet themes: a TOML theme format with dark and light variants, semantic colour roles with derived optional roles, built-in palettes, contrast checks, NO_COLOR, per-user theme editing helpers and optional ratatui colours."
 authors = ["Weird Brains LLC"]
 license = "BSD-3-Clause"
 repository = "https://github.com/WeirdBrains/weirdnet-themes"
@@ -15,8 +15,9 @@ categories = ["gui", "command-line-interface"]
 include = ["src/**", "themes/*.toml", "README.md", "LICENSE"]
 
 [features]
-default = ["terminal-background"]
-# `Mode::System` also asks the terminal for its background (OSC 11) before the OS preference.
+default = []
+# Lets `detect::Probe::terminal` ask the terminal for its background (OSC 11). Off by default,
+# and even when on, only `resolve_variant_with` / `detect::system_variant` with that probe query.
 terminal-background = ["dep:terminal-light"]
 # Resolve variants to ratatui colours by terminal colour depth.
 ratatui = ["dep:ratatui"]
@@ -25,6 +26,7 @@ ratatui = ["dep:ratatui"]
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 thiserror = "2"
+dirs = "6"
 terminal-light = { version = "1", optional = true }
 ratatui = { version = "0.30", optional = true, default-features = false }
 

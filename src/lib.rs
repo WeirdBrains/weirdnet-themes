@@ -1,11 +1,24 @@
 //! Themes: `<themes dir>/<name>/interface.toml` with `[meta]`, `[dark]` and `[light]` variants.
 //!
-//! Brand- and app-free: the caller supplies where themes live ([`ThemeDirs`]) and its own
-//! preference type converts into [`Mode`]. See the README for the features.
+//! Brand- and app-free: the caller supplies where themes live ([`ThemeDirs`], or [`UserDir`] for
+//! the per-user default) and its own preference type converts into [`Mode`]. See the README for
+//! the features.
+//!
+//! - Roles: the 21 required [`ROLES`] plus the [`OPTIONAL_ROLES`] (surface, code background,
+//!   diff backgrounds, link, dim text), which [`VariantDef::color`] derives when a theme leaves
+//!   them out.
+//! - Editing and switching: [`list`], [`entries`], [`load`], [`save`], [`duplicate`],
+//!   [`rename`], [`delete`], [`import`], [`export`], [`unique_name`], [`cycle`] and
+//!   [`VariantDef::set_role`].
+//! - Terminals: [`ColorDepth`] (with `NO_COLOR` and [`ColorDepth::None`]); the `ratatui` feature
+//!   maps a variant to ratatui colours.
+//! - Light or dark: [`resolve_variant`] never probes the terminal or the OS;
+//!   [`resolve_variant_with`] and [`detect::Probe`] opt in.
 #![forbid(unsafe_code)]
 
 pub mod detect;
 mod error;
+mod manage;
 mod term;
 
 use serde::{Deserialize, Serialize};
@@ -13,9 +26,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub use error::{Result, ThemeError};
-pub use term::ColorDepth;
+pub use manage::{Removed, ThemeEntry, UserDir, cycle, delete, duplicate, entries, exists, export, import, is_builtin, rename, unique_name};
+pub use term::{ColorDepth, no_color};
 #[cfg(feature = "ratatui")]
-pub use term::{Theme, to_color};
+pub use term::{Theme, to_bg_color, to_color};
 
 /// The file holding one theme inside its folder.
 pub const THEME_FILE: &str = "interface.toml";
@@ -51,6 +65,9 @@ impl ThemeDirs for PlainDir {
 }
 
 /// Light, dark, or follow the system. The app's preference type converts into it.
+///
+/// [`resolve_variant`] resolves `System` from environment hints only (`COLORFGBG`); pass a
+/// [`detect::Probe`] to [`resolve_variant_with`] to also ask the terminal (OSC 11) or the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Mode {
     Light,
@@ -84,6 +101,24 @@ pub const ROLES: [&str; 21] = [
     "chart_6",
 ];
 
+/// Optional roles. A theme may set them; [`VariantDef::color`] derives the ones it leaves out
+/// from the required roles, so theme files without them keep loading:
+///
+/// | role | fallback |
+/// |---|---|
+/// | `surface` (panels, popups) | `bg` mixed 5% toward `fg` |
+/// | `code_bg` (code blocks) | `surface` |
+/// | `diff_add_bg` | `bg` mixed 16% toward `up` |
+/// | `diff_remove_bg` | `bg` mixed 16% toward `down` |
+/// | `link` | `info` |
+/// | `dim` (hints, timestamps) | `muted` mixed 35% toward `bg` |
+pub const OPTIONAL_ROLES: [&str; 6] = ["surface", "code_bg", "diff_add_bg", "diff_remove_bg", "link", "dim"];
+
+/// Whether `role` is a required or optional role.
+pub fn is_role(role: &str) -> bool {
+    ROLES.contains(&role) || OPTIONAL_ROLES.contains(&role)
+}
+
 pub const DEFAULT_THEME: &str = "tokyo-night";
 
 /// Built-in themes compiled into the binary.
@@ -95,6 +130,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("nord", include_str!("../themes/nord.toml")),
     ("one", include_str!("../themes/one.toml")),
     ("solarized", include_str!("../themes/solarized.toml")),
+    ("bragi", include_str!("../themes/bragi.toml")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +203,49 @@ impl VariantDef {
         parse_hex(v).or_else(|| self.palette.get(v).and_then(|h| parse_hex(h)))
     }
 
+    /// A role's colour, deriving an [optional role](OPTIONAL_ROLES) the theme leaves out (or
+    /// sets to something that does not resolve). `None` only for unknown or unresolvable
+    /// required roles.
+    pub fn color(&self, role: &str) -> Option<(u8, u8, u8)> {
+        if let Some(c) = self.resolve(role) {
+            return Some(c);
+        }
+        let r = |name: &str| self.resolve(name);
+        match role {
+            "surface" => Some(mix(r("bg")?, r("fg")?, 0.05)),
+            "code_bg" => self.color("surface"),
+            "diff_add_bg" => Some(mix(r("bg")?, r("up")?, 0.16)),
+            "diff_remove_bg" => Some(mix(r("bg")?, r("down")?, 0.16)),
+            "link" => r("info"),
+            "dim" => Some(mix(r("muted")?, r("bg")?, 0.35)),
+            _ => None,
+        }
+    }
+
+    /// Sets a role (required or optional) to a palette name or `#rrggbb` (stored lowercase).
+    pub fn set_role(&mut self, role: &str, value: &str) -> Result<()> {
+        if !is_role(role) {
+            return Err(ThemeError::invalid("role", format!("`{role}` is not a theme role")));
+        }
+        let value = value.trim();
+        let stored = match parse_hex(value) {
+            Some(c) => to_hex(c),
+            None if self.palette.contains_key(value) => value.to_string(),
+            None => return Err(ThemeError::invalid("role", format!("`{role}` = `{value}` is neither #rrggbb nor a palette name"))),
+        };
+        self.roles.insert(role.to_string(), stored);
+        Ok(())
+    }
+
+    /// Removes an optional role so it is derived again. Required roles cannot be cleared.
+    pub fn clear_role(&mut self, role: &str) -> Result<()> {
+        if !OPTIONAL_ROLES.contains(&role) {
+            return Err(ThemeError::invalid("role", format!("`{role}` is not an optional role")));
+        }
+        self.roles.remove(role);
+        Ok(())
+    }
+
     /// Distinct colors offered by the editor: the palette plus any literal role values.
     pub fn swatches(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = self.palette.iter().map(|(k, h)| (k.clone(), h.clone())).collect();
@@ -205,8 +284,11 @@ impl ThemeFile {
                 }
             }
             for k in v.roles.keys() {
-                if !ROLES.contains(&k.as_str()) {
+                if !is_role(k) {
                     return Err(ThemeError::invalid("theme", format!("[{vn}] has unknown role `{k}`")));
+                }
+                if v.resolve(k).is_none() {
+                    return Err(ThemeError::invalid("theme", format!("[{vn}] role `{k}` = `{}` is neither #rrggbb nor a palette name", v.roles[k])));
                 }
             }
         }
@@ -239,7 +321,7 @@ impl ThemeFile {
     pub fn generate_variant(&mut self, target: Variant) {
         let src = self.variant(target.toggle()).clone();
         let mut out = VariantDef { variant_name: Some(format!("{} (generated)", target.name())), ..Default::default() };
-        for r in ROLES {
+        for r in ROLES.iter().chain(OPTIONAL_ROLES.iter().filter(|r| src.roles.contains_key(**r))) {
             if let Some(c) = src.resolve(r) {
                 out.roles.insert(r.to_string(), to_hex(invert_lightness(c)));
             }
@@ -258,6 +340,12 @@ pub fn valid_name(n: &str) -> Result<()> {
         return Err(ThemeError::invalid("theme name", format!("`{n}` (use letters, digits, - and _)")));
     }
     Ok(())
+}
+
+/// Linear blend from `a` (t = 0) to `b` (t = 1), per channel.
+pub fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    (m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
 }
 
 fn invert_lightness((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
@@ -339,6 +427,7 @@ pub fn materialize(paths: &(impl ThemeDirs + ?Sized)) -> Result<()> {
 
 /// Restore the shipped version of a built-in theme.
 pub fn reset(paths: &(impl ThemeDirs + ?Sized), name: &str) -> Result<()> {
+    valid_name(name)?;
     let (_, text) =
         BUILTINS.iter().find(|(n, _)| *n == name).ok_or_else(|| ThemeError::invalid("theme", format!("`{name}` is not a built-in theme")))?;
     let dir = paths.theme_dir(name);
@@ -348,7 +437,9 @@ pub fn reset(paths: &(impl ThemeDirs + ?Sized), name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Loads a theme: the user's file when there is one, else the built-in of that name.
 pub fn load(paths: &(impl ThemeDirs + ?Sized), name: &str) -> Result<ThemeFile> {
+    valid_name(name)?;
     let p = paths.theme_dir(name).join(THEME_FILE);
     if !p.exists() {
         return builtin(name).ok_or_else(|| ThemeError::invalid("theme", format!("`{name}` not found in {}", paths.themes_dir().display())));
@@ -356,6 +447,8 @@ pub fn load(paths: &(impl ThemeDirs + ?Sized), name: &str) -> Result<ThemeFile> 
     ThemeFile::parse(&std::fs::read_to_string(&p)?).map_err(|e| ThemeError::invalid("theme", format!("{}: {e}", p.display())))
 }
 
+/// Validates and writes `t` to `<themes dir>/<t.meta.name>/interface.toml` (a user file with a
+/// built-in's name overrides that built-in until [`delete`] or [`reset`]).
 pub fn save(paths: &(impl ThemeDirs + ?Sized), t: &ThemeFile) -> Result<()> {
     t.validate()?;
     let dir = paths.theme_dir(&t.meta.name);
@@ -372,7 +465,7 @@ pub fn list(paths: &(impl ThemeDirs + ?Sized)) -> Result<Vec<String>> {
     if let Ok(rd) = std::fs::read_dir(paths.themes_dir()) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
-            if e.path().join(THEME_FILE).exists() && !v.contains(&n) {
+            if e.path().join(THEME_FILE).exists() && !v.contains(&n) && valid_name(&n).is_ok() {
                 extra.push(n);
             }
         }
@@ -382,12 +475,19 @@ pub fn list(paths: &(impl ThemeDirs + ?Sized)) -> Result<Vec<String>> {
     Ok(v)
 }
 
-/// Resolve the active variant from a mode.
+/// Resolve the active variant from a mode. `System` uses environment hints only
+/// ([`detect::env_variant`]), else dark: no terminal query and no subprocess.
 pub fn resolve_variant(mode: impl Into<Mode>) -> Variant {
+    resolve_variant_with(mode, detect::Probe::NONE)
+}
+
+/// Resolve the active variant from a mode, letting `System` also run the probes in `probe`
+/// (the terminal background over OSC 11, the OS preference).
+pub fn resolve_variant_with(mode: impl Into<Mode>, probe: detect::Probe) -> Variant {
     match mode.into() {
         Mode::Dark => Variant::Dark,
         Mode::Light => Variant::Light,
-        Mode::System => detect::system_variant(),
+        Mode::System => detect::system_variant(probe),
     }
 }
 
@@ -405,7 +505,7 @@ mod tests {
 
     #[test]
     fn builtins_are_valid_and_complete() {
-        assert_eq!(BUILTINS.len(), 7);
+        assert_eq!(BUILTINS.len(), 8);
         for (n, t) in BUILTINS {
             let th = ThemeFile::parse(t).unwrap_or_else(|e| panic!("{n}: {e}"));
             assert_eq!(&th.meta.name, n);
@@ -475,6 +575,7 @@ mod tests {
         assert!(list(&d).unwrap().contains(&"my-nord".to_string()));
         assert_eq!(load(&d, "my-nord").unwrap(), t);
         assert_eq!(resolve_variant(Mode::Light), Variant::Light);
+        assert_eq!(resolve_variant_with(Mode::Dark, detect::Probe::ALL), Variant::Dark);
         assert_eq!(resolve_variant(Mode::Dark), Variant::Dark);
     }
 
@@ -506,5 +607,98 @@ mod tests {
         assert_eq!(Theme::from_variant_depth(v, ColorDepth::TrueColor).bg, Color::Rgb(0x1a, 0x1b, 0x26));
         assert!(matches!(Theme::from_variant_depth(v, ColorDepth::Ansi256).bg, Color::Indexed(_)));
         assert_eq!(to_color((255, 0, 0), ColorDepth::Ansi16), Color::Indexed(9));
+        // 16 colours keep the terminal's own background and text; accents still map.
+        let t16 = Theme::from_variant_depth(v, ColorDepth::Ansi16);
+        assert_eq!(
+            (t16.bg, t16.fg, t16.surface, t16.code_bg, t16.diff_add_bg),
+            (Color::Reset, Color::Reset, Color::Reset, Color::Reset, Color::Reset)
+        );
+        assert!(matches!(t16.accent, Color::Indexed(_)));
+        assert!(matches!(Theme::from_variant_depth(v, ColorDepth::Ansi16).selection_bg, Color::Indexed(_)));
+        // No colour at all.
+        let none = Theme::from_variant_depth(v, ColorDepth::None);
+        assert!(!none.has_color());
+        assert_eq!((none.accent, none.link, none.selection_bg, none.charts[0]), (Color::Reset, Color::Reset, Color::Reset, Color::Reset));
+        assert_eq!(to_bg_color((1, 2, 3), ColorDepth::TrueColor), Color::Rgb(1, 2, 3));
+        // The optional roles, set (Bragi) and derived (Tokyo Night).
+        let b = Theme::from_variant_depth(&builtin("bragi").unwrap().dark, ColorDepth::TrueColor);
+        assert_eq!(
+            (b.accent, b.bg, b.link, b.diff_add_bg),
+            (Color::Rgb(0xf5, 0xb8, 0x3d), Color::Rgb(0x14, 0x16, 0x1b), Color::Rgb(0x7f, 0xd4, 0xf5), Color::Rgb(0x17, 0x33, 0x22))
+        );
+        let t = Theme::from_variant_depth(v, ColorDepth::TrueColor);
+        assert_eq!(t.link, t.info);
+        assert_ne!(t.surface, t.bg);
+        assert_eq!(t.code_bg, t.surface);
+    }
+
+    #[test]
+    fn optional_roles_fall_back_and_validate() {
+        for (n, _) in BUILTINS {
+            let th = builtin(n).unwrap();
+            for v in [&th.dark, &th.light] {
+                for r in OPTIONAL_ROLES {
+                    assert!(v.color(r).is_some(), "{n} {r}");
+                }
+                assert_ne!(v.color("surface"), v.color("bg"), "{n}");
+                assert_ne!(v.color("diff_add_bg"), v.color("diff_remove_bg"), "{n}");
+            }
+        }
+        let t = builtin("nord").unwrap();
+        assert!(OPTIONAL_ROLES.iter().all(|r| !t.dark.roles.contains_key(*r)), "older theme files have none");
+        assert_eq!(t.dark.color("link"), t.dark.resolve("info"));
+        assert_eq!(t.dark.color("code_bg"), t.dark.color("surface"));
+        assert_eq!(t.dark.color("surface"), Some(mix(t.dark.resolve("bg").unwrap(), t.dark.resolve("fg").unwrap(), 0.05)));
+        assert_eq!(t.dark.color("nope"), None);
+        let b = builtin("bragi").unwrap();
+        assert_eq!(b.dark.color("code_bg"), parse_hex("#1c1f26"));
+        assert_eq!(b.light.color("link"), parse_hex("#0e3b5c"));
+        assert!(contrast_warnings(&b.dark).is_empty() && contrast_warnings(&b.light).is_empty());
+        // A set optional role must resolve; unknown roles are still refused.
+        let text = BUILTINS.iter().find(|(n, _)| *n == "nord").unwrap().1;
+        let bad = text.replacen("[dark]\n", "[dark]\nlink = \"nowhere\"\n", 1);
+        assert!(ThemeFile::parse(&bad).unwrap_err().to_string().contains("role `link` = `nowhere`"));
+        let ok = text.replacen("[dark]\n", "[dark]\nlink = \"#00ff00\"\n", 1);
+        assert_eq!(ThemeFile::parse(&ok).unwrap().dark.color("link"), Some((0, 255, 0)));
+        let unknown = text.replacen("[dark]\n", "[dark]\nsparkle = \"#00ff00\"\n", 1);
+        assert!(ThemeFile::parse(&unknown).unwrap_err().to_string().contains("unknown role `sparkle`"));
+    }
+
+    #[test]
+    fn set_and_clear_roles() {
+        let mut t = builtin("nord").unwrap();
+        t.dark.set_role("link", " #ABCDEF ").unwrap();
+        assert_eq!(t.dark.roles["link"], "#abcdef");
+        t.dark.set_role("accent", "nord8").unwrap();
+        assert_eq!(t.dark.set_role("sparkle", "#000000").unwrap_err().to_string(), "invalid role: `sparkle` is not a theme role");
+        assert!(t.dark.set_role("fg", "nowhere").is_err());
+        t.dark.clear_role("link").unwrap();
+        assert_eq!(t.dark.color("link"), t.dark.resolve("info"));
+        assert!(t.dark.clear_role("fg").is_err());
+        t.validate().unwrap();
+        // Generated variants keep the optional roles a theme sets.
+        let mut b = builtin("bragi").unwrap();
+        b.generate_variant(Variant::Light);
+        assert!(b.light.roles.contains_key("code_bg"));
+        b.validate().unwrap();
+    }
+
+    #[test]
+    fn color_depth_parse_and_choice() {
+        assert_eq!(ColorDepth::parse("TrueColor"), Some(ColorDepth::TrueColor));
+        assert_eq!(ColorDepth::parse("256"), Some(ColorDepth::Ansi256));
+        assert_eq!(ColorDepth::parse("16"), Some(ColorDepth::Ansi16));
+        assert_eq!(ColorDepth::parse("off"), Some(ColorDepth::None));
+        assert_eq!(ColorDepth::parse("lots"), None);
+        assert_eq!(ColorDepth::detect_with(Some("none")), ColorDepth::None);
+        assert_eq!(ColorDepth::detect_with(Some("lots")), ColorDepth::detect());
+        assert!(!ColorDepth::None.has_color() && ColorDepth::Ansi16.has_color());
+    }
+
+    #[test]
+    fn names_are_checked_before_touching_files() {
+        let d = PlainDir(std::path::PathBuf::from("/nonexistent"));
+        assert!(load(&d, "../etc").unwrap_err().to_string().starts_with("invalid theme name"));
+        assert!(reset(&d, "a/b").is_err());
     }
 }
