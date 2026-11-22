@@ -1,7 +1,7 @@
 [package]
 name = "weirdnet-themes"
 # Its own SemVer, independent of the workspace version.
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Weirdnet themes: a TOML theme format with dark and light variants, semantic colour roles with derived optional roles, built-in palettes, contrast checks, NO_COLOR, per-user theme editing helpers and optional ratatui colours."
