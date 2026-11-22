@@ -2,6 +2,14 @@
 
 Running notes for [weirdnet-themes](https://github.com/WeirdBrains/weirdnet-themes), newest first.
 
+## 2026-11-22: release 0.2.0
+
+- What changed: `00b5ce5` (CI green) released as 0.2.0 with `scripts/weirdnet_release.py` (commit `release: v0.2.0`, annotated tag [v0.2.0](https://github.com/WeirdBrains/weirdnet-themes/releases/tag/v0.2.0)), published to [crates.io](https://crates.io/crates/weirdnet-themes/0.2.0); docs at [docs.rs](https://docs.rs/weirdnet-themes/0.2.0). Breaking, hence the minor bump: see [CHANGELOG.md](CHANGELOG.md).
+- Checks: the release script's checks from `release.toml` (fmt, clippy `--all-features -D warnings`, `cargo test --all-features`, `cargo doc -D warnings`), then the crates.io upload.
+- Not tested: as in the entry below.
+- Left: nothing for this release.
+- Next: Bragi moves to 0.2.0 and drops its local theme workarounds.
+
 ## 2026-11-22: Bragi theme, optional roles, NO_COLOR, theme editing helpers (main, unreleased)
 
 - What changed (`475757b`): the built-in [Bragi](https://github.com/WeirdBrains/bragi) theme;
